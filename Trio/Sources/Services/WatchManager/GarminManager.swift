@@ -483,7 +483,7 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
             NSPredicate.pumpHistoryLast24h,
             tempBasalPredicate
         ])
-        
+
         let results = try await CoreDataStack.shared.fetchEntitiesAsync(
             ofType: PumpEventStored.self,
             onContext: backgroundContext,
@@ -805,7 +805,8 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
 
                 // Get display configuration from settings
                 let displayPrimaryAttributeChoice = self.settingsManager.settings.garminSettings.primaryAttributeChoice.rawValue
-                let displaySecondaryAttributeChoice = self.settingsManager.settings.garminSettings.secondaryAttributeChoice.rawValue
+                let displaySecondaryAttributeChoice = self.settingsManager.settings.garminSettings.secondaryAttributeChoice
+                    .rawValue
 
                 // Process glucose readings
                 // For Trio: Process 2 readings (to calculate delta) but only send 1 entry
@@ -959,10 +960,7 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
 
     /// Formats a Date to HH:mm:ss string for logging
     private func formatTimeForLog(_ date: Date = Date()) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        formatter.timeZone = TimeZone.current
-        return formatter.string(from: date)
+        Formatter.timeForLogFormatter.string(from: date)
     }
 
     // MARK: - Simulated Device (for Xcode Simulator Testing)
@@ -1607,7 +1605,7 @@ extension BaseGarminManager: SettingsObserver {
             // Re-register devices to add/remove watchface app based on enabled state
             registerDevices(devices)
 
-            if !settings.garminSettings.isWatchfaceDataEnabled {  // ← REVERSED LOGIC
+            if !settings.garminSettings.isWatchfaceDataEnabled { // ← REVERSED LOGIC
                 debugGarmin("Garmin: Watchface app unregistered, datafield continues")
             } else {
                 debugGarmin("Garmin: Watchface app re-registered - sending immediate update")
@@ -1640,7 +1638,7 @@ extension BaseGarminManager: SettingsObserver {
         // Determine which type of update is needed (if any)
         let needsImmediateUpdate = (
             unitsChanged ||
-                (enabledChanged && settings.garminSettings.isWatchfaceDataEnabled)  // ← REVERSED LOGIC
+                (enabledChanged && settings.garminSettings.isWatchfaceDataEnabled) // ← REVERSED LOGIC
         ) &&
             !watchfaceChanged && !datafieldChanged // Don't send if only watchface or datafield changed
 
