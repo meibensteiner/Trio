@@ -1108,7 +1108,7 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
     /// Total delay: ~4s from first CoreData save to Bluetooth transmission (faster than old 10s throttle)
     private func subscribeToDeterminationThrottle() {
         determinationSubject
-            .debounce(for: .seconds(2), scheduler: DispatchQueue.main)
+            .debounce(for: .seconds(2), scheduler: timerQueue)
             .sink { [weak self] data in
                 guard let self = self else { return }
 
