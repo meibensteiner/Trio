@@ -17,11 +17,12 @@ struct WatchConfigGarminAppConfigView: View {
             // MARK: - Watchface Selection Section
 
             Section(
+                header: Text("Watchface Settings"),
                 content: {
                     VStack {
                         Picker(
                             selection: $state.garminWatchface,
-                            label: Text("Watch App selection").multilineTextAlignment(.leading)
+                            label: Text("Watchface Selection").multilineTextAlignment(.leading)
                         ) {
                             ForEach(GarminWatchface.allCases) { selection in
                                 Text(selection.displayName).tag(selection)
@@ -34,7 +35,7 @@ struct WatchConfigGarminAppConfigView: View {
 
                         HStack(alignment: .center) {
                             Text(
-                                "Choose which watchface/datafield to support."
+                                "Choose which watchface to support."
                             )
                             .font(.footnote)
                             .foregroundColor(.secondary)
@@ -51,15 +52,7 @@ struct WatchConfigGarminAppConfigView: View {
                                 }
                             ).buttonStyle(BorderlessButtonStyle())
                         }.padding(.top)
-                    }.padding(.vertical)
-                }
-            ).listRowBackground(Color.chart)
-
-            // MARK: - Disable Watchface Data Section
-
-            Section(
-                content: {
-                    VStack {
+                        Spacer()
                         Toggle("Disable Watchface Data", isOn: $state.garminDisableWatchfaceData)
                             .disabled(state.isDisableToggleLocked)
 
@@ -101,22 +94,25 @@ struct WatchConfigGarminAppConfigView: View {
                 }
             ).listRowBackground(Color.chart)
 
-            // MARK: - Data Type 1 Selection Section
+            // MARK: - Datafield Selection Section
 
             Section(
+                header: Text("Datafield Settings"),
                 content: {
                     VStack {
                         Picker(
-                            selection: $state.garminDataType1,
-                            label: Text("Data Field 1").multilineTextAlignment(.leading)
+                            selection: $state.garminDatafield,
+                            label: Text("Datafield Selection").multilineTextAlignment(.leading)
                         ) {
-                            ForEach(GarminDataType1.allCases) { selection in
+                            ForEach(GarminDatafield.allCases) { selection in
                                 Text(selection.displayName).tag(selection)
                             }
-                        }.padding(.top)
+                        }
+                        .padding(.top)
+
                         HStack(alignment: .center) {
                             Text(
-                                "Choose between display of COB or Sensitivity Ratio on Garmin device."
+                                "Choose which datafield to support. Can be used independently of watchface selection."
                             )
                             .font(.footnote)
                             .foregroundColor(.secondary)
@@ -124,7 +120,7 @@ struct WatchConfigGarminAppConfigView: View {
                             Spacer()
                             Button(
                                 action: {
-                                    shouldDisplayHint3.toggle()
+                                    shouldDisplayHint4.toggle()
                                 },
                                 label: {
                                     HStack {
@@ -137,14 +133,23 @@ struct WatchConfigGarminAppConfigView: View {
                 }
             ).listRowBackground(Color.chart)
 
-            // MARK: - Data Type 2 Selection Section (Both Watchfaces)
+            // MARK: - Data Type 1 Selection Section
 
             Section(
+                header: Text("Watch App Display Settings"),
                 content: {
                     VStack {
                         Picker(
+                            selection: $state.garminDataType1,
+                            label: Text("DataChoice 1").multilineTextAlignment(.leading)
+                        ) {
+                            ForEach(GarminDataType1.allCases) { selection in
+                                Text(selection.displayName).tag(selection)
+                            }
+                        }.padding(.top)
+                        Picker(
                             selection: $state.garminDataType2,
-                            label: Text("Data Field 2").multilineTextAlignment(.leading)
+                            label: Text("DataChoice 2").multilineTextAlignment(.leading)
                         ) {
                             ForEach(GarminDataType2.allCases) { selection in
                                 Text(selection.displayName).tag(selection)
@@ -152,7 +157,7 @@ struct WatchConfigGarminAppConfigView: View {
                         }.padding(.top)
                         HStack(alignment: .center) {
                             Text(
-                                "Choose between display of TBR or Eventual BG on Garmin device."
+                                "Choose between displayed data types on Garmin device."
                             )
                             .font(.footnote)
                             .foregroundColor(.secondary)
@@ -160,7 +165,7 @@ struct WatchConfigGarminAppConfigView: View {
                             Spacer()
                             Button(
                                 action: {
-                                    shouldDisplayHint4.toggle()
+                                    shouldDisplayHint3.toggle()
                                 },
                                 label: {
                                     HStack {
@@ -183,11 +188,23 @@ struct WatchConfigGarminAppConfigView: View {
             SettingInputHintView(
                 hintDetent: $hintDetent,
                 shouldDisplayHint: $shouldDisplayHint1,
-                hintLabel: "Choose Garmin App support.",
+                hintLabel: "Choose Garmin Watchface",
                 hintText: Text(
-                    "Choose which watchface and datafield combination on your Garmin device you wish to provide data for. Both watchfaces now use the same data structure and configuration options.\n\n" +
+                    "Choose which watchface on your Garmin device you wish to provide data for. You can independently select which datafield to use in the next section.\n\n" +
                         "You must use this configuration setting here BEFORE you switch the watchface on your Garmin device to another watchface.\n\n" +
                         "⚠️ Changing the watchface will automatically disable data transmission and lock that setting for 20 seconds to allow time for you to switch the watchface on your Garmin device."
+                ),
+                sheetTitle: String(localized: "Help", comment: "Help sheet title")
+            )
+        }
+        .sheet(isPresented: $shouldDisplayHint4) {
+            SettingInputHintView(
+                hintDetent: $hintDetent,
+                shouldDisplayHint: $shouldDisplayHint4,
+                hintLabel: "Choose Garmin Datafield",
+                hintText: Text(
+                    "Choose which datafield on your Garmin device you wish to provide data for. The datafield can be used independently from the watchface selection.\n\n" +
+                        "Select 'None' if you don't want to use a datafield,or want to preserve battery while not exercising."
                 ),
                 sheetTitle: String(localized: "Help", comment: "Help sheet title")
             )
@@ -210,18 +227,7 @@ struct WatchConfigGarminAppConfigView: View {
                 shouldDisplayHint: $shouldDisplayHint3,
                 hintLabel: "Choose data support",
                 hintText: Text(
-                    "Choose which data type, along BG and IOB etc., you want to show on your Garmin device. That data type will be shown both on watchface and datafield"
-                ),
-                sheetTitle: String(localized: "Help", comment: "Help sheet title")
-            )
-        }
-        .sheet(isPresented: $shouldDisplayHint4) {
-            SettingInputHintView(
-                hintDetent: $hintDetent,
-                shouldDisplayHint: $shouldDisplayHint4,
-                hintLabel: "Choose data support",
-                hintText: Text(
-                    "Choose which data type, along BG and IOB etc., you want to show on your Garmin device. That data type will be shown both on watchface and datafield"
+                    "Choose which data types, along BG and IOB etc., you want to show on your Garmin device. That data type will be shown both on watchface and datafield"
                 ),
                 sheetTitle: String(localized: "Help", comment: "Help sheet title")
             )

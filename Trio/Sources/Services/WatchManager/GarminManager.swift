@@ -5,6 +5,14 @@ import Foundation
 import os // For thread-safe OSAllocatedUnfairLock
 import Swinject
 
+// SIMPLIFIED VERSION - Key Changes:
+// 1. If datafield UUID exists, ALWAYS send data (bypasses status checks)
+// 2. Only skip sending if:
+//    - No apps configured at all, OR
+//    - ONLY watchface configured AND data transmission is disabled
+// 3. Datafield messages are ALWAYS processed
+// 4. Datafield never requires ConnectIQ status check (unreliable)
+
 // MARK: - GarminManager Protocol
 
 /// Manages Garmin devices, allowing the app to select devices, update a known device list,
@@ -112,6 +120,13 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
     /// How long to trust cached app status (in seconds)
     private let appStatusCacheTimeout: TimeInterval = 60 // 1 minute
 
+    /// Throttle duration for non-critical updates (settings changes, status requests)
+    private let throttleDuration: TimeInterval = 10 // 10 seconds
+
+    /// Status request filter duration - ignore requests if we sent data this recently
+    /// Safety net since watchface handles this with 320s timer reset (agreed Oct 15)
+    private let statusRequestFilterDuration: TimeInterval = 120 // 2 minutes
+
     /// Deduplication: Track last prepared data hash to prevent duplicate expensive work
     private var lastPreparedDataHash: Int?
     private var lastPreparedWatchState: [GarminWatchState]?
@@ -130,15 +145,18 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
 
     /// Current glucose units, either mg/dL or mmol/L, read from user settings.
     private var units: GlucoseUnits = .mgdL
-
     /// Track previous watchface settings
     private var previousWatchface: GarminWatchface = .trio
+    private var previousDatafield: GarminDatafield = .none
     private var previousDataType1: GarminDataType1 = .cob
     private var previousDataType2: GarminDataType2 = .tbr
-    private var previousDisableWatchfaceData: Bool = false
+    private var previousDisableWatchfaceData: Bool = true
 
     /// Queue for handling Core Data change notifications
     private let queue = DispatchQueue(label: "BaseGarminManager.queue", qos: .utility)
+
+    /// Dedicated queue for throttle timers to avoid blocking main thread
+    private let timerQueue = DispatchQueue(label: "BaseGarminManager.timerQueue", qos: .utility)
 
     /// Publishes any changed CoreData objects that match our filters (e.g., OrefDetermination, GlucoseStored).
     private var coreDataPublisher: AnyPublisher<Set<NSManagedObjectID>, Never>?
@@ -175,7 +193,6 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
 
         subscribeToOpenFromGarminConnect()
         subscribeToDeterminationThrottle()
-        // Note: Old subscribeToWatchState() removed - using manual timer management for 30s
 
         units = settingsManager.settings.units
 
@@ -238,10 +255,11 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                                     .watchManager,
                                     "[\(self.formatTimeForLog())] Garmin: Glucose skipped - no loop data available (infinite loop age)"
                                 )
-                            } else {
+                            } else if loopAge.isFinite {
+                                let loopAgeMinutes = Int(loopAge / 60)
                                 debug(
                                     .watchManager,
-                                    "[\(self.formatTimeForLog())] Garmin: Glucose skipped - loop age \(Int(loopAge / 60))m < 8m"
+                                    "[\(self.formatTimeForLog())] Garmin: Glucose skipped - loop age \(loopAgeMinutes)m < 8m"
                                 )
                             }
                         }
@@ -316,6 +334,12 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
     private var currentDataType2: GarminDataType2 {
         // Direct access since it's not optional
         settingsManager.settings.garminDataType2
+    }
+
+    /// Safely gets the current Garmin datafield setting
+    private var currentDatafield: GarminDatafield {
+        // Direct access since it's not optional
+        settingsManager.settings.garminDatafield
     }
 
     /// Check if watchface data is disabled
@@ -393,63 +417,62 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
         }
     }
 
-    /// 30-second throttle for Status/Settings updates
-    private func sendWatchStateDataWith30sThrottle(_ data: Data) {
+    /// Throttle for Status/Settings updates
+    private func sendWatchStateDataWithThrottle(_ data: Data) {
         // Store the latest data (always keep the newest)
-        pendingThrottledData30s = data
+        pendingThrottledData = data
 
-        // If timer is already running, just update data - DON'T restart timer
-        if throttleTimer30s?.isValid == true {
+        // If work item is already scheduled, just update data - DON'T reschedule
+        if throttleWorkItem != nil {
             debug(
                 .watchManager,
-                "[\(formatTimeForLog())] Garmin: 30s throttle timer running, data updated [Trigger: \(currentSendTrigger)]"
+                "[\(formatTimeForLog())] Garmin: throttle timer running, data updated [Trigger: \(currentSendTrigger)]"
             )
             return
         }
 
-        // Start new 30s timer ONLY if none exists
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-
-            self.throttleTimer30s = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: false) { [weak self] _ in
-                guard let self = self,
-                      let dataToSend = self.pendingThrottledData30s
-                else {
-                    return
-                }
-
-                // Check if immediate send (determination/IOB) happened while we were waiting
-                if let lastImmediate = self.lastImmediateSendTime,
-                   Date().timeIntervalSince(lastImmediate) < 5
-                {
-                    debugGarmin("[\(self.formatTimeForLog())] Garmin: 30s timer cancelled - recent determination/IOB send")
-                    self.throttleTimer30s = nil
-                    self.pendingThrottledData30s = nil
-                    self.throttledUpdatePending = false
-                    return
-                }
-
-                // Convert data to JSON object for sending
-                guard let jsonObject = try? JSONSerialization.jsonObject(with: dataToSend, options: []) else {
-                    debugGarmin("[\(self.formatTimeForLog())] Garmin: Invalid JSON in 30s throttled data")
-                    self.throttleTimer30s = nil
-                    self.pendingThrottledData30s = nil
-                    self.throttledUpdatePending = false
-                    return
-                }
-
-                debugGarmin("[\(self.formatTimeForLog())] Garmin: 30s timer fired - sending collected updates")
-                self.broadcastStateToWatchApps(jsonObject as Any)
-
-                // Clean up
-                self.throttleTimer30s = nil
-                self.pendingThrottledData30s = nil
-                self.throttledUpdatePending = false
+        // Create and schedule new work item on dedicated timer queue
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  let dataToSend = self.pendingThrottledData
+            else {
+                return
             }
 
-            self.throttledUpdatePending = true
-            debugGarmin("[\(self.formatTimeForLog())] Garmin: 30s throttle timer started")
+            // Check if immediate send happened while we were waiting
+            // Use throttle duration window to prevent duplicates
+            if let lastImmediate = self.lastImmediateSendTime,
+               Date().timeIntervalSince(lastImmediate) < self.throttleDuration
+            {
+                debugGarmin("[\(self.formatTimeForLog())] Garmin: timer cancelled - recent immediate send")
+                self.throttleWorkItem = nil
+                self.pendingThrottledData = nil
+                self.throttledUpdatePending = false
+                return
+            }
+
+            // Convert data to JSON object for sending
+            guard let jsonObject = try? JSONSerialization.jsonObject(with: dataToSend, options: []) else {
+                debugGarmin("[\(self.formatTimeForLog())] Garmin: Invalid JSON in throttled data")
+                self.throttleWorkItem = nil
+                self.pendingThrottledData = nil
+                self.throttledUpdatePending = false
+                return
+            }
+
+            debugGarmin("[\(self.formatTimeForLog())] Garmin: timer fired - sending collected updates")
+            self.broadcastStateToWatchApps(jsonObject as Any)
+
+            // Clean up
+            self.throttleWorkItem = nil
+            self.pendingThrottledData = nil
+            self.throttledUpdatePending = false
         }
+
+        throttleWorkItem = workItem
+        timerQueue.asyncAfter(deadline: .now() + throttleDuration, execute: workItem)
+        throttledUpdatePending = true
+        debugGarmin("[\(formatTimeForLog())] Garmin: throttle timer started (\(Int(throttleDuration))s) on dedicated queue")
     }
 
     /// Fetches recent glucose readings from CoreData, up to specified limit.
@@ -517,8 +540,11 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
 
             // Hash IOB (changes frequently with insulin activity)
             if let iob = iobService.currentIOB {
-                let iobRounded = Double(iob).roundedDouble(toPlaces: 1)
-                hasher.combine(iobRounded)
+                let iobDouble = Double(iob)
+                if iobDouble.isFinite, !iobDouble.isNaN {
+                    let iobRounded = iobDouble.roundedDouble(toPlaces: 1)
+                    hasher.combine(iobRounded)
+                }
             }
 
             // Hash latest determination data (includes COB, ISF, eventualBG, sensRatio)
@@ -532,13 +558,13 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                 await backgroundContext.perform {
                     // Hash COB (rounded to integer)
                     let cobDouble = Double(determination.cob)
-                    if cobDouble.isFinite, !cobDouble.isNaN {
+                    if cobDouble.isFinite, !cobDouble.isNaN, cobDouble >= -32768, cobDouble <= 32767 {
                         let cobInt = Int16(cobDouble)
                         hasher.combine(cobInt)
                     }
 
-                    // Hash sensRatio (autoISFratio) with 2 decimal precision
-                    if let sensRatio = determination.autoISFratio {
+                    // Hash sensRatio with 2 decimal precision
+                    if let sensRatio = determination.sensitivityRatio {
                         let sensRatioDouble = Double(truncating: sensRatio as NSNumber)
                         if sensRatioDouble.isFinite, !sensRatioDouble.isNaN, sensRatioDouble > 0 {
                             let sensRounded = sensRatioDouble.roundedDouble(toPlaces: 2)
@@ -572,8 +598,11 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                     if let tempBasalData = latestTempBasal.tempBasal,
                        let rate = tempBasalData.rate
                     {
-                        let rateRounded = Double(truncating: rate).roundedDouble(toPlaces: 1)
-                        hasher.combine(rateRounded)
+                        let rateDouble = Double(truncating: rate)
+                        if rateDouble.isFinite, !rateDouble.isNaN {
+                            let rateRounded = rateDouble.roundedDouble(toPlaces: 1)
+                            hasher.combine(rateRounded)
+                        }
                     }
                 }
             }
@@ -665,7 +694,8 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
 
                 // Calculate IOB with 1 decimal precision using helper function
                 let iobDecimal = self.iobService.currentIOB ?? 0
-                let iobValue = Double(iobDecimal).roundedDouble(toPlaces: 1)
+                let iobDouble = Double(iobDecimal)
+                let iobValue = iobDouble.isFinite && !iobDouble.isNaN ? iobDouble.roundedDouble(toPlaces: 1) : 0.0
 
                 // Calculate COB, sensRatio, ISF, eventualBG, TBR from determination
                 var cobValue: Double?
@@ -743,11 +773,18 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                    let tempBasalData = firstTempBasal.tempBasal,
                    let tempRate = tempBasalData.rate
                 {
-                    // Send raw value without rounding
-                    tbrValue = Double(truncating: tempRate)
-
-                    if self.debugWatchState {
-                        debug(.watchManager, "⌚️ Current basal rate: \(tbrValue ?? 0) U/hr from temp basal")
+                    // Send raw value without rounding, with NaN/Infinity guard
+                    let tbrDouble = Double(truncating: tempRate)
+                    if tbrDouble.isFinite, !tbrDouble.isNaN {
+                        tbrValue = tbrDouble
+                        if self.debugWatchState {
+                            debug(.watchManager, "⌚️ Current basal rate: \(tbrValue!) U/hr from temp basal")
+                        }
+                    } else {
+                        tbrValue = nil
+                        if self.debugWatchState {
+                            debug(.watchManager, "⌚️ TBR is NaN or infinite, excluding from data")
+                        }
                     }
                 } else {
                     // If no temp basal, get scheduled basal from profile
@@ -762,7 +799,10 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                         var currentBasalRate: Double = 0
                         for entry in basalProfile.reversed() {
                             if entry.minutes <= currentTimeMinutes {
-                                currentBasalRate = Double(entry.rate)
+                                let rateDouble = Double(entry.rate)
+                                if rateDouble.isFinite, !rateDouble.isNaN {
+                                    currentBasalRate = rateDouble
+                                }
                                 break
                             }
                         }
@@ -772,7 +812,7 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                             tbrValue = currentBasalRate
 
                             if self.debugWatchState {
-                                debug(.watchManager, "⌚️ Current scheduled basal rate: \(tbrValue ?? 0) U/hr from profile")
+                                debug(.watchManager, "⌚️ Current scheduled basal rate: \(tbrValue!) U/hr from profile")
                             }
                         }
                     }
@@ -899,8 +939,9 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
         guard debugWatchState else { return }
 
         let watchface = currentWatchface
+        let datafield = currentDatafield
         let watchfaceUUID = watchface.watchfaceUUID?.uuidString ?? "Unknown"
-        let datafieldUUID = watchface.datafieldUUID?.uuidString ?? "Unknown"
+        let datafieldUUID = datafield.datafieldUUID?.uuidString ?? "Unknown"
 
         do {
             let jsonData = try JSONEncoder().encode(watchState)
@@ -1003,6 +1044,9 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
             // Get current watchface setting
             let watchface = currentWatchface
 
+            // Get current datafield setting
+            let datafield = currentDatafield
+
             // Create a watchface app using the UUID from the enum
             // Only register watchface if data is NOT disabled
             if !isWatchfaceDataDisabled {
@@ -1030,12 +1074,12 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
             }
 
             // ALWAYS create and register data field app (not affected by disable setting)
-            if let datafieldUUID = watchface.datafieldUUID,
+            if let datafieldUUID = datafield.datafieldUUID,
                let watchDataFieldApp = IQApp(uuid: datafieldUUID, store: UUID(), device: device)
             {
                 debug(
                     .watchManager,
-                    "Garmin: Registering data field (UUID: \(datafieldUUID)) for device \(device.friendlyName ?? "Unknown")"
+                    "Garmin: Registering \(datafield.displayName) datafield (UUID: \(datafieldUUID)) for device \(device.friendlyName ?? "Unknown")"
                 )
 
                 // Track datafield app
@@ -1101,7 +1145,13 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
                     self.cachedDeterminationData = data
                 }
 
-                self.lastImmediateSendTime = Date() // Mark for any 30s timers (status requests, settings)
+                self.lastImmediateSendTime = Date() // Mark for any pending throttled timers (status requests, settings)
+
+                // Cancel any pending throttled send since determination is sending immediately
+                self.throttleWorkItem?.cancel()
+                self.throttleWorkItem = nil
+                self.pendingThrottledData = nil
+                self.throttledUpdatePending = false
 
                 // Convert data to JSON object for sending
                 guard let jsonObject = try? JSONSerialization.jsonObject(with: data, options: []) else {
@@ -1130,47 +1180,96 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
         deviceSelectionPromise = nil
     }
 
-    /// Sends the given state dictionary to all known watch apps (watchface & data field) by checking
-    /// if each app is installed and then sending messages asynchronously.
+    /// SIMPLIFIED: Broadcasts state to watch apps
+    /// Always sends to datafield (if exists), only checks status for watchface
     /// - Parameter state: The dictionary representing the watch state to be broadcast.
     private func broadcastStateToWatchApps(_ state: Any) {
+        // Update display types in the state before sending (handles cached/throttled data)
+        let updatedState = updateDisplayTypesInState(state)
+
         // Log connection health status if we have failures
         if failedSendCount > 0 {
-            let timeSinceLastSuccess = lastSuccessfulSendTime.map { Date().timeIntervalSince($0) } ?? .infinity
+            let timeString: String
+            if let lastSuccess = lastSuccessfulSendTime {
+                let timeSince = Date().timeIntervalSince(lastSuccess)
+                timeString = "\(Int(timeSince))s"
+            } else {
+                timeString = "never"
+            }
             debug(
                 .watchManager,
-                "[\(formatTimeForLog())] Garmin: Broadcasting with \(failedSendCount) recent failures. Last success: \(Int(timeSinceLastSuccess))s ago"
+                "[\(formatTimeForLog())] Garmin: Broadcasting with \(failedSendCount) recent failures. Last success: \(timeString) ago"
             )
         }
 
-        watchApps.forEach { app in
-            // Check if this is the watchface app
-            let watchface = currentWatchface
-            let isWatchfaceApp = app.uuid == watchface.watchfaceUUID
+        let watchface = currentWatchface
+        let datafield = currentDatafield
 
-            // Skip broadcasting to watchface if data is disabled
-            if isWatchfaceDataDisabled, isWatchfaceApp {
-                debugGarmin("[\(formatTimeForLog())] Garmin: Watchface data disabled, skipping broadcast to watchface")
+        watchApps.forEach { app in
+            let isWatchfaceApp = app.uuid == watchface.watchfaceUUID
+            let isDatafieldApp = app.uuid == datafield.datafieldUUID
+
+            // SIMPLIFIED LOGIC:
+            // 1. If it's a datafield, ALWAYS send (no status check)
+            if isDatafieldApp {
+                debug(.watchManager, "[\(formatTimeForLog())] Garmin: Sending to datafield \(app.uuid!) (no status check)")
+                sendMessage(updatedState, to: app)
                 return
             }
 
+            // 2. If it's a watchface and data is disabled, skip
+            if isWatchfaceApp, isWatchfaceDataDisabled {
+                debugGarmin("[\(formatTimeForLog())] Garmin: Watchface data disabled, skipping")
+                return
+            }
+
+            // 3. For watchface with data enabled, do normal status check
             connectIQ?.getAppStatus(app) { [weak self] status in
                 guard let self = self else { return }
                 let isInstalled = status?.isInstalled == true
 
-                // Update cache with current status
+                // Update cache
                 if let uuid = app.uuid {
                     self.updateAppStatusCache(uuid: uuid, isInstalled: isInstalled)
                 }
 
                 guard isInstalled else {
-                    self.debugGarmin("[\(self.formatTimeForLog())] Garmin: App not installed on device: \(app.uuid!)")
+                    self.debugGarmin("[\(self.formatTimeForLog())] Garmin: Watchface not installed: \(app.uuid!)")
                     return
                 }
-                debug(.watchManager, "[\(self.formatTimeForLog())] Garmin: Sending watch-state to app \(app.uuid!)")
-                self.sendMessage(state, to: app)
+
+                debug(.watchManager, "[\(self.formatTimeForLog())] Garmin: Sending to watchface \(app.uuid!)")
+                self.sendMessage(updatedState, to: app)
             }
         }
+    }
+
+    /// Updates display type fields in the state array/object with current settings
+    /// - Parameter state: The state object (either array or dict) to update
+    /// - Returns: Updated state with current displayDataType1 and displayDataType2
+    private func updateDisplayTypesInState(_ state: Any) -> Any {
+        let displayType1 = currentDataType1.rawValue
+        let displayType2 = currentDataType2.rawValue
+
+        // Handle array of states (normal case)
+        if var stateArray = state as? [[String: Any]] {
+            // Only update the first element (index 0) which contains extended data
+            if !stateArray.isEmpty {
+                stateArray[0]["displayDataType1"] = displayType1
+                stateArray[0]["displayDataType2"] = displayType2
+            }
+            return stateArray
+        }
+
+        // Handle single state dict (shouldn't happen but be safe)
+        if var stateDict = state as? [String: Any] {
+            stateDict["displayDataType1"] = displayType1
+            stateDict["displayDataType2"] = displayType2
+            return stateDict
+        }
+
+        // Return unchanged if unexpected type
+        return state
     }
 
     // MARK: - App Status Cache Management
@@ -1185,50 +1284,30 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
         )
     }
 
-    /// Checks if any Garmin apps are likely to receive data based on cached status and settings
-    /// Returns true if cache suggests apps will receive data, or if cache is empty (optimistic on first check)
-    /// Considers both app installation status AND whether watchface data is disabled
-    /// Cache is trusted indefinitely and only cleared on settings changes or device re-registration
+    /// SIMPLIFIED: Returns true if we should prepare and send data
+    /// True if: datafield exists OR (watchface exists AND data is enabled)
+    /// False only if: no apps at all OR (only watchface AND data disabled)
     private func areAppsLikelyInstalled() -> Bool {
-        appStatusCacheLock.lock()
-        defer { appStatusCacheLock.unlock() }
-
-        // Get current watchface info for disabled check (always accurate, not cached)
         let watchface = currentWatchface
-        let watchfaceUUIDString = watchface.watchfaceUUID?.uuidString
+        let datafield = currentDatafield
 
-        // If cache is empty, check if we should be optimistic
-        guard !appInstallationCache.isEmpty else {
-            // Even with empty cache, check if watchface data is disabled
-            // If disabled and no datafield in cache, we know nothing will receive data
+        // If datafield UUID exists, ALWAYS return true
+        if datafield.datafieldUUID != nil {
+            return true // Datafield exists, always send data
+        }
+
+        // No datafield, check watchface
+        if watchface.watchfaceUUID != nil {
+            // Watchface exists, check if data is enabled
             if isWatchfaceDataDisabled {
-                // No cache entries and watchface disabled means likely no receivers
-                debugGarmin(
-                    "[\(formatTimeForLog())] Garmin: ⏩ Skipping data preparation - watchface disabled, no cache for datafield"
-                )
+                debugGarmin("[\(formatTimeForLog())] Garmin: ⏩ Skipping - only watchface exists and data disabled")
                 return false
             }
-            // Be optimistic on first check - assume datafield might be installed
-            return true
+            return true // Watchface exists and data enabled
         }
 
-        // Check each app in cache (trust cache indefinitely - no timeout)
-        for (uuidString, status) in appInstallationCache {
-            // If this is the watchface and data is disabled, skip it regardless of cache
-            if uuidString == watchfaceUUIDString {
-                if isWatchfaceDataDisabled {
-                    continue // Watchface won't receive data (disabled) - check other apps
-                }
-            }
-
-            // If app is installed (per cache), we have a receiver
-            if status.isInstalled {
-                return true // Found a receiver
-            }
-        }
-
-        // No apps will receive data (either not installed or watchface is disabled)
-        debugGarmin("[\(formatTimeForLog())] Garmin: ⏩ Skipping data preparation - no apps will receive data (cached)")
+        // No apps configured at all
+        debugGarmin("[\(formatTimeForLog())] Garmin: ⏩ Skipping - no apps configured")
         return false
     }
 
@@ -1265,7 +1344,7 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
     /// Only used for throttled updates (IOB, DataType changes)
     /// - Parameter data: JSON-encoded data representing the latest watch state.
     func sendWatchStateData(_ data: Data) {
-        sendWatchStateDataWith30sThrottle(data)
+        sendWatchStateDataWithThrottle(data)
     }
 
     /// Sends watch state data immediately, bypassing the 30-second throttling
@@ -1302,9 +1381,9 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable, @unchecked S
     private var failedSendCount = 0
     private var connectionAlertShown = false
 
-    // Manual throttle for 30s updates
-    private var throttleTimer30s: Timer?
-    private var pendingThrottledData30s: Data?
+    // Manual throttle for updates - using DispatchWorkItem instead of Timer
+    private var throttleWorkItem: DispatchWorkItem?
+    private var pendingThrottledData: Data?
 
     // Combine subject for 10s throttled Determinations
     private let determinationSubject = PassthroughSubject<Data, Never>()
@@ -1423,55 +1502,62 @@ extension BaseGarminManager: IQUIOverrideDelegate, IQDeviceEventDelegate, IQAppM
     /// - Parameters:
     ///   - message: The message content from the watch app.
     ///   - app: The watch app sending the message.
+    /// SIMPLIFIED: Handle messages from watch apps
+    /// Always processes datafield messages, checks settings for watchface
     func receivedMessage(_ message: Any, from app: IQApp) {
         debugGarmin("[\(formatTimeForLog())] Garmin: Received message \(message) from app \(app.uuid!)")
 
-        // Check if this message is from the watchface (not datafield)
         let watchface = currentWatchface
-        let isFromWatchface = app.uuid == watchface.watchfaceUUID
+        let datafield = currentDatafield
+        let validUUIDs = Set([watchface.watchfaceUUID, datafield.datafieldUUID].compactMap { $0 })
 
-        // If data is disabled AND the message is from the watchface, ignore it
-        if isWatchfaceDataDisabled, isFromWatchface {
-            debugGarmin("[\(formatTimeForLog())] Garmin: Watchface data disabled, ignoring message from watchface")
+        // Must be from a configured app
+        guard validUUIDs.contains(app.uuid!) else {
+            debugGarmin("[\(formatTimeForLog())] ⏭️ Ignoring message from unregistered app: \(app.uuid!)")
             return
         }
 
+        let isFromWatchface = app.uuid == watchface.watchfaceUUID
+        let isFromDatafield = app.uuid == datafield.datafieldUUID
+
+        // SIMPLIFIED LOGIC:
+        // Skip watchface messages only if data is disabled
+        if isFromWatchface, isWatchfaceDataDisabled {
+            debugGarmin("[\(formatTimeForLog())] Garmin: Watchface data disabled, ignoring watchface message")
+            return
+        }
+
+        // If from datafield, always mark it as installed in cache
+        if isFromDatafield {
+            updateAppStatusCache(uuid: app.uuid!, isInstalled: true)
+            debugGarmin("[\(formatTimeForLog())] Garmin: Datafield sent message - confirmed installed")
+        }
+
         Task {
-            // Check if the message is literally the string "status"
-            guard
-                let statusString = message as? String,
-                statusString == "status"
-            else {
+            // Check if requesting status
+            guard let statusString = message as? String, statusString == "status" else {
                 return
             }
 
-            // Check if we sent an update very recently (within last 10 seconds)
+            // Simple rate limiting: ignore if sent update recently
             if let lastImmediate = self.lastImmediateSendTime,
-               Date().timeIntervalSince(lastImmediate) < 10
+               Date().timeIntervalSince(lastImmediate) < self.statusRequestFilterDuration
             {
-                debug(
-                    .watchManager,
-                    "[\(self.formatTimeForLog())] Garmin: Status request ignored - just sent update \(Int(Date().timeIntervalSince(lastImmediate)))s ago"
+                debugGarmin(
+                    "[\(self.formatTimeForLog())] Garmin: Status ignored - sent \(Int(Date().timeIntervalSince(lastImmediate)))s ago"
                 )
                 return
             }
 
-            // Use throttled send for status requests to avoid spam
-            // Skip if no apps are installed (based on cache)
-            guard self.areAppsLikelyInstalled() else {
-                debugGarmin("[\(self.formatTimeForLog())] ⏩ Skipping status request - no apps installed (cached)")
-                return
-            }
-
+            // Always prepare and send if we get here
             do {
                 let watchState = try await self.setupGarminWatchState(triggeredBy: "Status-Request")
                 let watchStateData = try JSONEncoder().encode(watchState)
                 self.currentSendTrigger = "Status-Request"
-                // Use 30s throttle to prevent status request spam
-                self.sendWatchStateDataWith30sThrottle(watchStateData)
-                debugGarmin("[\(self.formatTimeForLog())] Garmin: Status request queued for throttled send")
+                self.sendWatchStateDataWithThrottle(watchStateData)
+                debugGarmin("[\(self.formatTimeForLog())] Garmin: Status request queued")
             } catch {
-                debugGarmin("[\(self.formatTimeForLog())] Garmin: Cannot encode watch state: \(error)")
+                debugGarmin("[\(self.formatTimeForLog())] Garmin: Error: \(error)")
             }
         }
     }
@@ -1485,6 +1571,7 @@ extension BaseGarminManager: SettingsObserver {
 
         // Check what changed by comparing with stored previous values
         let watchfaceChanged = previousWatchface != settings.garminWatchface
+        let datafieldChanged = previousDatafield != settings.garminDatafield
         let dataType1Changed = previousDataType1 != settings.garminDataType1
         let dataType2Changed = previousDataType2 != settings.garminDataType2
         let unitsChanged = units != settings.units
@@ -1495,6 +1582,13 @@ extension BaseGarminManager: SettingsObserver {
             debug(
                 .watchManager,
                 "Garmin: Watchface changed from \(previousWatchface.displayName) to \(settings.garminWatchface.displayName). Re-registering devices only, no data update"
+            )
+        }
+
+        if datafieldChanged {
+            debug(
+                .watchManager,
+                "Garmin: Datafield changed from \(previousDatafield.displayName) to \(settings.garminDatafield.displayName). Re-registering devices only, no data update"
             )
         }
 
@@ -1535,13 +1629,14 @@ extension BaseGarminManager: SettingsObserver {
         // NOW update stored values AFTER logging the changes
         units = settings.units
         previousWatchface = settings.garminWatchface
+        previousDatafield = settings.garminDatafield
         previousDataType1 = settings.garminDataType1
         previousDataType2 = settings.garminDataType2
         previousDisableWatchfaceData = settings.garminDisableWatchfaceData
 
-        // Handle watchface change - ONLY re-register, NO data send
-        if watchfaceChanged {
-            // Clear cached determination data after watchface change
+        // Handle watchface or datafield change - ONLY re-register, NO data send
+        if watchfaceChanged || datafieldChanged {
+            // Clear cached determination data after watchface/datafield change
             cachedDeterminationData = nil
             lastWatchfaceChangeTime = Date()
 
@@ -1563,10 +1658,10 @@ extension BaseGarminManager: SettingsObserver {
             unitsChanged ||
                 (disabledChanged && !settings.garminDisableWatchfaceData)
         ) &&
-            !watchfaceChanged // Don't send if only watchface changed
+            !watchfaceChanged && !datafieldChanged // Don't send if only watchface or datafield changed
 
         let needsThrottledUpdate = (dataType1Changed || dataType2Changed) &&
-            !watchfaceChanged // Don't send if only watchface changed
+            !watchfaceChanged && !datafieldChanged // Don't send if only watchface or datafield changed
 
         // Send immediate update for critical changes
         if needsImmediateUpdate {
@@ -1581,6 +1676,13 @@ extension BaseGarminManager: SettingsObserver {
                     // Try to use cached determination data first to avoid CoreData staleness
                     if let cachedData = self.cachedDeterminationData {
                         self.currentSendTrigger = "Settings-Units/Re-enable"
+
+                        // Cancel any pending throttled send since we're sending immediately
+                        self.throttleWorkItem?.cancel()
+                        self.throttleWorkItem = nil
+                        self.pendingThrottledData = nil
+                        self.throttledUpdatePending = false
+
                         debugGarmin("Garmin: Using cached determination data for immediate settings update")
                         self.sendWatchStateDataImmediately(cachedData)
                         self.lastImmediateSendTime = Date()
@@ -1590,6 +1692,13 @@ extension BaseGarminManager: SettingsObserver {
                         let watchState = try await self.setupGarminWatchState(triggeredBy: "Settings-Units/Re-enable")
                         let watchStateData = try JSONEncoder().encode(watchState)
                         self.currentSendTrigger = "Settings-Units/Re-enable"
+
+                        // Cancel any pending throttled send since we're sending immediately
+                        self.throttleWorkItem?.cancel()
+                        self.throttleWorkItem = nil
+                        self.pendingThrottledData = nil
+                        self.throttledUpdatePending = false
+
                         self.sendWatchStateDataImmediately(watchStateData)
                         self.lastImmediateSendTime = Date()
                         debugGarmin("Garmin: Immediate update sent for units/re-enable change (fresh query)")
@@ -1611,18 +1720,25 @@ extension BaseGarminManager: SettingsObserver {
                     return
                 }
 
-                do {
-                    let watchState = try await self.setupGarminWatchState(triggeredBy: "Settings-DataType")
-                    let watchStateData = try JSONEncoder().encode(watchState)
+                // Use cached data if available (display types will be updated at send time)
+                if let cachedData = self.cachedDeterminationData {
                     self.currentSendTrigger = "Settings-DataType"
-                    // DataType changes use 30s throttling
-                    self.sendWatchStateDataWith30sThrottle(watchStateData)
-                    debugGarmin("Garmin: Throttled update queued for data type change")
-                } catch {
-                    debug(
-                        .watchManager,
-                        "\(DebuggingIdentifiers.failed) Failed to send throttled update after settings change: \(error)"
-                    )
+                    self.sendWatchStateDataWithThrottle(cachedData)
+                    debugGarmin("Garmin: Throttled update queued for data type change (10s) - using cached data")
+                } else {
+                    // No cached data - prepare fresh (shouldn't happen often)
+                    do {
+                        let watchState = try await self.setupGarminWatchState(triggeredBy: "Settings-DataType")
+                        let watchStateData = try JSONEncoder().encode(watchState)
+                        self.currentSendTrigger = "Settings-DataType"
+                        self.sendWatchStateDataWithThrottle(watchStateData)
+                        debugGarmin("Garmin: Throttled update queued for data type change (10s) - fresh data")
+                    } catch {
+                        debug(
+                            .watchManager,
+                            "\(DebuggingIdentifiers.failed) Failed to send throttled update after settings change: \(error)"
+                        )
+                    }
                 }
             }
         }
